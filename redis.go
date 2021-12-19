@@ -1,4 +1,4 @@
-package main
+package redis
 
 import (
 	"bufio"
@@ -8,62 +8,59 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 )
 
 var crlf = []byte("\r\n")
 
 type Client struct {
-	dialer net.Dialer
-	conn   net.Conn
+	dialer  net.Dialer
+	conn    net.Conn
+	address string
 }
 
-func main() {
-	dialer := net.Dialer{}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := dialer.DialContext(ctx, "tcp", ":6379")
-
+func New(ctx context.Context, address string) (*Client, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		log.Fatalln(err)
+		return nil, err
 	}
+	return &Client{
+		address: address,
+		conn:    conn,
+		dialer:  dialer,
+	}, nil
+}
+
+func (c *Client) Get(ctx context.Context, key string) (string, error) {
+
 	deadline, _ := ctx.Deadline()
-	if err := conn.SetDeadline(deadline); err != nil {
-		log.Fatalln(err)
-	}
-	n, err := conn.Write(command("LRANGE a 0 -1"))
-	fmt.Println(n)
-	fmt.Println(err)
-
-	buf := make([]byte, 1024)
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(buf, -1)
+	err := c.conn.SetDeadline(deadline)
 	if err != nil {
-		log.Fatalln(err)
+		return "", err
 	}
-	fmt.Println(scanner.Scan())
-	if scanner.Err() != nil {
-		log.Fatalln(scanner.Err())
+	_, err = c.conn.Write(command("GET " + key))
+	if err != nil {
+		return "", err
+	}
+
+	scanner := bufio.NewScanner(c.conn)
+
+	if !scanner.Scan() || scanner.Err() != nil {
+		return "", scanner.Err()
 	}
 	token := scanner.Text()
 	switch token[0] {
-	case '+':
-		fmt.Println("Was Simple string type: ", token[1:])
 	case '-':
-		fmt.Println("Was Error type: ", token[1:])
-	case ':':
-		fmt.Println("Was Integer type: ", token[1:])
+		return "", fmt.Errorf("redis: %v", token[1:])
 	case '$':
 		bulk, err := getBulkString(token, scanner)
-		fmt.Println("Was Bulk String type: ", bulk)
-		fmt.Println("err was", err)
-	case '*':
-		arr, err := getArray(token, scanner)
-		fmt.Println("Was Array type: ", arr)
-		fmt.Println("err was", err)
+		if bulk == nil {
+			return "", err
+		}
+		return *bulk, err
 	default:
-		log.Fatalln("unknown RESP response ", token)
+		c.conn.Close()
+		return "", fmt.Errorf("redis: unexpected response %v", token[1:])
 	}
 }
 
