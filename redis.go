@@ -31,8 +31,11 @@ func New(ctx context.Context, address string) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) Get(ctx context.Context, key string) (string, error) {
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
 
+func (c *Client) Get(ctx context.Context, key string) (string, error) {
 	deadline, _ := ctx.Deadline()
 	err := c.conn.SetDeadline(deadline)
 	if err != nil {
