@@ -57,6 +57,40 @@ func (c *Client) Get(ctx context.Context, key string) (value string, exists bool
 	return c.get(ctx, key)
 }
 
+func (c *Client) Set(ctx context.Context, key string, value string) error {
+	if deadline, set := ctx.Deadline(); set {
+		if err := c.conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+
+	_, err := c.conn.Write(command(fmt.Sprintf("SET %s %s", key, value)))
+	if err != nil {
+		return err
+	}
+	reader := bufio.NewReader(c.conn)
+	msgType, err := reader.ReadByte()
+	if err != nil {
+		return err
+	}
+
+	switch msgType {
+	case '-':
+		return readErrorMessage(reader)
+	case '+':
+		ok, err := readSimpleString(reader)
+		if ok != "OK" {
+			return fmt.Errorf("redis: expected OK from Redis but got: %v", ok)
+		}
+		return err
+	case '$':
+		_, _, err := readBulkString(reader)
+		return err
+	default:
+		return fmt.Errorf("redis: unexpected message type %v", msgType)
+	}
+}
+
 func (c *Client) get(ctx context.Context, key string) (string, bool, error) {
 	if deadline, set := ctx.Deadline(); set {
 		if err := c.conn.SetDeadline(deadline); err != nil {
@@ -92,6 +126,14 @@ func readErrorMessage(reader *bufio.Reader) error {
 		return err
 	}
 	return errors.New(errMsg[0 : len(errMsg)-2])
+}
+
+func readSimpleString(reader *bufio.Reader) (string, error) {
+	simpleString, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return simpleString[0 : len(simpleString)-2], nil
 }
 
 func readBulkString(reader *bufio.Reader) (string, bool, error) {

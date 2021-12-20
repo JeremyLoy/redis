@@ -16,7 +16,10 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	v, err := client.Get(ctx, "X")
-	fmt.Println(v)
-	fmt.Println(err)
+	// v, exists, err := client.Get(ctx, "X")
+	// fmt.Println(v)
+	// fmt.Println(exists)
+	// fmt.Println(err)
+
+	fmt.Println(client.Set(ctx, "A", "foo"))
 }

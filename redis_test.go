@@ -13,6 +13,7 @@ import (
 
 var crlf = []byte("\r\n")
 var nullString = []byte("$-1\r\n")
+var okString = []byte("+OK\r\n")
 
 type TestRedisServer struct {
 	listener *net.TCPListener
@@ -95,9 +96,16 @@ func asSimpleErrorString(s string) []byte {
 	return builder
 }
 
+func asSimpleString(s string) []byte {
+	builder := append([]byte(nil), '+')
+	builder = append(builder, s...)
+	builder = append(builder, crlf...)
+	return builder
+}
+
 func integrationClient(t *testing.T) *redis.Client {
 	t.Helper()
-	if os.Getenv("INTEGRATION") == "" {
+	if os.Getenv("INTEGRATION") != "" {
 		t.Skip()
 	}
 	c, err := redis.New(context.Background(), ":6379")
@@ -179,12 +187,56 @@ func TestClient_Get(t *testing.T) {
 	}
 }
 
+func TestClient_Set(t *testing.T) {
+	ts, c := serverClientPair(t)
+	tests := []struct {
+		name     string
+		response []byte
+		wantErr  error
+	}{
+		{
+			"OK",
+			okString,
+			nil,
+		},
+		{
+			"Bulk response is not an error",
+			asBulkString("A long string"),
+			nil,
+		},
+		{
+			"Error messages are converted to errors",
+			asSimpleErrorString("WRONGTYPE Operation against a key holding the wrong kind of value"),
+			errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			ts.data <- tt.response
+			err := c.Set(context.Background(), "Foo", "bar")
+
+			if (err != nil) != (tt.wantErr != nil) {
+				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil && tt.wantErr.Error() != err.Error() {
+				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func Test_Integration(t *testing.T) {
 	c := integrationClient(t)
-	want := "bar"
+	key := "X"
+	want := "baz"
 
-	got, _, err := c.Get(context.Background(), "X")
+	err := c.Set(context.Background(), key, want)
+	if err != nil {
+		t.Errorf("Set() error = %v", err)
+	}
 
+	got, _, err := c.Get(context.Background(), key)
 	if err != nil {
 		t.Errorf("Get() error = %v, wantErr %v", err, nil)
 		return
