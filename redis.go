@@ -3,8 +3,9 @@ package redis
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -12,12 +13,24 @@ import (
 
 var crlf = []byte("\r\n")
 
+// Error is a type used to distinguish between i/o errors and errors from Redis itself.
+// See https://redis.io/topics/protocol#resp-errors for more info
+type Error struct {
+	msg string
+}
+
+func (e Error) Error() string {
+	return e.msg
+}
+
+// A Client represents a single connection to Redis. It should be constructed with New. It is not safe for concurrent access.
 type Client struct {
 	dialer  net.Dialer
 	conn    net.Conn
 	address string
 }
 
+// New creates a new Redis Client at the given address. It does not handle authentication at this time.
 func New(ctx context.Context, address string) (*Client, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", address)
@@ -31,93 +44,84 @@ func New(ctx context.Context, address string) (*Client, error) {
 	}, nil
 }
 
+// Close closes the underlying net.Conn
 func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-func (c *Client) Get(ctx context.Context, key string) (string, error) {
-	deadline, _ := ctx.Deadline()
-	err := c.conn.SetDeadline(deadline)
-	if err != nil {
-		return "", err
-	}
-	_, err = c.conn.Write(command("GET " + key))
-	if err != nil {
-		return "", err
+// Get the value of the given key. If you wish to distinguish between a nil or empty string, check the exists bool.
+// If you solely wish to check for existence, you should use Exists instead.
+func (c *Client) Get(ctx context.Context, key string) (value string, exists bool, err error) {
+	// Using named return values for documentation clarity, but I don't want to deal with it
+	// in the code because it's a messy feature. The real Get is implemented in get
+	return c.get(ctx, key)
+}
+
+func (c *Client) get(ctx context.Context, key string) (string, bool, error) {
+	if deadline, set := ctx.Deadline(); set {
+		if err := c.conn.SetDeadline(deadline); err != nil {
+			return "", false, err
+		}
 	}
 
-	scanner := bufio.NewScanner(c.conn)
-
-	if !scanner.Scan() || scanner.Err() != nil {
-		return "", scanner.Err()
+	_, err := c.conn.Write(command("GET " + key))
+	if err != nil {
+		return "", false, err
 	}
-	token := scanner.Text()
-	switch token[0] {
+
+	reader := bufio.NewReader(c.conn)
+	msgType, err := reader.ReadByte()
+	if err != nil {
+		return "", false, err
+	}
+
+	switch msgType {
 	case '-':
-		return "", fmt.Errorf("redis: %v", token[1:])
+		return "", false, readErrorMessage(reader)
 	case '$':
-		bulk, err := getBulkString(token, scanner)
-		if bulk == nil {
-			return "", err
-		}
-		return *bulk, err
+		return readBulkString(reader)
 	default:
-		c.conn.Close()
-		return "", fmt.Errorf("redis: unexpected response %v", token[1:])
+		return "", false, fmt.Errorf("redis: unexpected message type %v", msgType)
 	}
 }
 
-func getArray(token string, scanner *bufio.Scanner) ([]interface{}, error) {
-	items, err := strconv.Atoi(token[1:])
+// either successfully reads the error message, returning an Error, or returns the i/o error
+func readErrorMessage(reader *bufio.Reader) error {
+	errMsg, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if items == -1 {
-		return nil, nil
-	}
-	if items == 0 {
-		return []interface{}{}, nil
-	}
-	var arr []interface{}
-	for i := 0; i < items; i++ {
-		scanner.Scan()
-		if scanner.Err() != nil {
-			log.Fatalln(scanner.Err())
-		}
-		token := scanner.Text()
-		switch token[0] {
-		case '+':
-			arr = append(arr, token[1:])
-		case ':':
-			ii, _ := strconv.Atoi(token)
-			arr = append(arr, ii)
-		case '$':
-			bulk, _ := getBulkString(token, scanner)
-			arr = append(arr, *bulk)
-		default:
-			log.Fatalln("unknown RESP response ", token)
-		}
-	}
-	return arr, nil
+	return errors.New(errMsg[0 : len(errMsg)-2])
 }
 
-func getBulkString(s string, scanner *bufio.Scanner) (*string, error) {
-	i, err := strconv.Atoi(s[1:])
+func readBulkString(reader *bufio.Reader) (string, bool, error) {
+	sizeS, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
-	if i == -1 {
-		return nil, nil
+	sizeS = sizeS[0 : len(sizeS)-2] // drop crlf
+	size, err := strconv.Atoi(sizeS)
+	if err != nil {
+		return "", false, err
 	}
-	if i == 0 {
-		return new(string), nil
-	} else {
-		scanner.Scan()
-		if scanner.Err() != nil {
-			return nil, scanner.Err()
+	switch size {
+	case 0:
+		_, err := reader.Discard(2)
+		if err != nil {
+			return "", false, err
 		}
-		s := scanner.Text()
-		return &s, nil
+		return "", true, nil
+	case -1:
+		// no need to Discard, ReadString ate the CRLF
+		return "", false, err
+	default:
+		msg := make([]byte, size+2) // for crlf. Alternatively reader.Discard(2) but that introduces another err check
+		_, err = io.ReadFull(reader, msg)
+		if err != nil {
+			return "", false, err
+		}
+		// discard crlf
+		return string(msg[0 : len(msg)-2]), true, nil
 	}
 }
 

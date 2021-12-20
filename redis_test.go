@@ -2,6 +2,7 @@ package redis_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 )
 
 var crlf = []byte("\r\n")
+var nullString = []byte("$-1\r\n")
 
 type TestRedisServer struct {
 	listener *net.TCPListener
@@ -34,9 +36,11 @@ func (c *TestRedisServer) Start(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to accept TCP conection: %v", err)
 		}
-		_, err = conn.Write(<-c.data)
-		if err != nil {
-			t.Logf("error in writing from server: %v", err)
+		for d := range c.data {
+			_, err = conn.Write(d)
+			if err != nil {
+				t.Logf("error in writing from server: %v", err)
+			}
 		}
 		// TODO need to close conn? or dose closing listener clean it up?
 	}()
@@ -60,6 +64,7 @@ func serverClientPair(t *testing.T) (*TestRedisServer, *redis.Client) {
 		if err != nil {
 			t.Logf("Failed to stop TestRedisServer: %v", err)
 		}
+		close(ts.data)
 	})
 	c, err := redis.New(context.Background(), ts.Address())
 	if err != nil {
@@ -83,6 +88,13 @@ func asBulkString(s string) []byte {
 	return builder
 }
 
+func asSimpleErrorString(s string) []byte {
+	builder := append([]byte(nil), '-')
+	builder = append(builder, s...)
+	builder = append(builder, crlf...)
+	return builder
+}
+
 func integrationClient(t *testing.T) *redis.Client {
 	t.Helper()
 	if os.Getenv("INTEGRATION") == "" {
@@ -100,20 +112,70 @@ func integrationClient(t *testing.T) *redis.Client {
 	})
 	return c
 }
-
 func TestClient_Get(t *testing.T) {
 	ts, c := serverClientPair(t)
-	want := "bar"
-
-	ts.data <- asBulkString(want)
-	got, err := c.Get(context.Background(), "X")
-
-	if err != nil {
-		t.Errorf("Get() error = %v, wantErr %v", err, nil)
-		return
+	tests := []struct {
+		name      string
+		response  []byte
+		want      string
+		wantExist bool
+		wantErr   error
+	}{
+		{
+			"Basic",
+			asBulkString("bar"),
+			"bar",
+			true,
+			nil,
+		},
+		{
+			"Error messages are converted to errors",
+			asSimpleErrorString("ERR wrong number of arguments for 'get' command"),
+			"",
+			false,
+			errors.New("ERR wrong number of arguments for 'get' command"),
+		},
+		{
+			"Bulk Strings containing CRLF are read in full",
+			asBulkString("bar\nbaz"),
+			"bar\nbaz",
+			true,
+			nil,
+		},
+		{
+			"Unset keys return notExist",
+			nullString,
+			"",
+			false,
+			nil,
+		},
+		{
+			"Empty values do exist",
+			asBulkString(""),
+			"",
+			true,
+			nil,
+		},
 	}
-	if got != want {
-		t.Errorf("Get() got = %v, want %v", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			ts.data <- tt.response
+			got, gotExist, err := c.Get(context.Background(), "Foo")
+
+			if (err != nil) != (tt.wantErr != nil) {
+				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil && tt.wantErr.Error() != err.Error() {
+				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("Get() got = %v, want %v", got, tt.want)
+			}
+			if gotExist != tt.wantExist {
+				t.Errorf("Get() gotExist = %v, want %v", gotExist, tt.wantExist)
+			}
+		})
 	}
 }
 
@@ -121,7 +183,7 @@ func Test_Integration(t *testing.T) {
 	c := integrationClient(t)
 	want := "bar"
 
-	got, err := c.Get(context.Background(), "X")
+	got, _, err := c.Get(context.Background(), "X")
 
 	if err != nil {
 		t.Errorf("Get() error = %v, wantErr %v", err, nil)
