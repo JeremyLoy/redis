@@ -13,47 +13,6 @@ import (
 var nullString = []byte("$-1\r\n")
 var okString = []byte("+OK\r\n")
 
-type TestRedisServer struct {
-	listener *net.TCPListener
-	data     chan []byte
-}
-
-func NewTestRedisServer() *TestRedisServer {
-	return &TestRedisServer{
-		data: make(chan []byte, 1),
-	}
-}
-
-func (c *TestRedisServer) Start(t *testing.T) {
-	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatalf("failed to start TestRedisServer: %v", err)
-	}
-	c.listener = listener.(*net.TCPListener)
-	go func() {
-		conn, err := c.listener.Accept()
-		if err != nil {
-			t.Fatalf("failed to accept TCP conection: %v", err)
-		}
-		for d := range c.data {
-			_, err = conn.Write(d)
-			if err != nil {
-				t.Logf("error in writing from server: %v", err)
-			}
-		}
-		// TODO need to close conn? or dose closing listener clean it up?
-	}()
-
-}
-
-func (c *TestRedisServer) Stop() error {
-	return c.listener.Close()
-}
-
-func (ts *TestRedisServer) Address() string {
-	return ":" + strconv.Itoa(ts.listener.Addr().(*net.TCPAddr).Port)
-}
-
 func serverClientPair(t *testing.T) (*Client, chan []byte) {
 	t.Helper()
 	client, err := New(context.Background(), "-1")
