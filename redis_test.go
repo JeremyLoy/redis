@@ -54,28 +54,21 @@ func (ts *TestRedisServer) Address() string {
 	return ":" + strconv.Itoa(ts.listener.Addr().(*net.TCPAddr).Port)
 }
 
-func serverClientPair(t *testing.T) (*TestRedisServer, *Client) {
+func serverClientPair(t *testing.T) (*Client, chan []byte) {
 	t.Helper()
-	ts := NewTestRedisServer()
-	ts.Start(t)
-	t.Cleanup(func() {
-		err := ts.Stop()
-		if err != nil {
-			t.Logf("Failed to stop TestRedisServer: %v", err)
-		}
-		close(ts.data)
-	})
-	c, err := New(context.Background(), ts.Address())
+	client, err := New(context.Background(), "-1")
 	if err != nil {
-		t.Fatalf("Failed to connect redis.Client: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		err := c.Close()
-		if err != nil {
-			t.Logf("Failed to stop redis.Client: %v", err)
-		}
-	})
-	return ts, c
+	conn, serv := net.Pipe()
+	client.pool <- conn
+	responseChan := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		serv.Read(buf)
+		serv.Write(<-responseChan)
+	}()
+	return client, responseChan
 }
 
 func asBulkString(s string) []byte {
@@ -119,7 +112,7 @@ func integrationClient(t *testing.T) *Client {
 	return c
 }
 func TestClient_Get(t *testing.T) {
-	ts, c := serverClientPair(t)
+	t.Parallel()
 	tests := []struct {
 		name      string
 		response  []byte
@@ -165,9 +158,11 @@ func TestClient_Get(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			client, responseChan := serverClientPair(t)
+			responseChan <- tt.response
 
-			ts.data <- tt.response
-			got, gotExist, err := c.Get(context.Background(), "Foo")
+			got, gotExist, err := client.Get(context.Background(), "Foo")
 
 			if (err != nil) != (tt.wantErr != nil) {
 				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
@@ -186,7 +181,7 @@ func TestClient_Get(t *testing.T) {
 }
 
 func TestClient_Set(t *testing.T) {
-	ts, c := serverClientPair(t)
+	t.Parallel()
 	tests := []struct {
 		name     string
 		response []byte
@@ -210,9 +205,11 @@ func TestClient_Set(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			client, responseChan := serverClientPair(t)
+			responseChan <- tt.response
 
-			ts.data <- tt.response
-			err := c.Set(context.Background(), "Foo", "bar")
+			err := client.Set(context.Background(), "Foo", "bar")
 
 			if (err != nil) != (tt.wantErr != nil) {
 				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
@@ -225,7 +222,9 @@ func TestClient_Set(t *testing.T) {
 }
 
 func TestConcurrency(t *testing.T) {
+	t.Parallel()
 	t.Run("Should use two independent connections and put them back", func(t *testing.T) {
+		t.Parallel()
 		client, err := New(context.Background(), "-1")
 		if err != nil {
 			t.Fatal(err)
