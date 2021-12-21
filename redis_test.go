@@ -24,8 +24,14 @@ func serverClientPair(t *testing.T) (*Client, chan []byte) {
 	responseChan := make(chan []byte, 1)
 	go func() {
 		buf := make([]byte, 2048)
-		serv.Read(buf)
-		serv.Write(<-responseChan)
+		_, err = serv.Read(buf)
+		if err != nil {
+			t.Error(err)
+		}
+		_, err = serv.Write(<-responseChan)
+		if err != nil {
+			t.Error(err)
+		}
 	}()
 	return client, responseChan
 }

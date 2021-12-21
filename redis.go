@@ -61,7 +61,7 @@ func (c *Client) getConn(ctx context.Context) (net.Conn, error) {
 	case conn := <-c.pool:
 		deadline, _ := ctx.Deadline()
 		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			// Not sure why SetDeadline can fail, but if it does discard the Conn
 			// and try again below
 		} else {
