@@ -1,4 +1,4 @@
-package redis_test
+package redis
 
 import (
 	"context"
@@ -6,12 +6,10 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
-
-	"github.com/JeremyLoy/redis"
 )
 
-var crlf = []byte("\r\n")
 var nullString = []byte("$-1\r\n")
 var okString = []byte("+OK\r\n")
 
@@ -56,7 +54,7 @@ func (ts *TestRedisServer) Address() string {
 	return ":" + strconv.Itoa(ts.listener.Addr().(*net.TCPAddr).Port)
 }
 
-func serverClientPair(t *testing.T) (*TestRedisServer, *redis.Client) {
+func serverClientPair(t *testing.T) (*TestRedisServer, *Client) {
 	t.Helper()
 	ts := NewTestRedisServer()
 	ts.Start(t)
@@ -67,7 +65,7 @@ func serverClientPair(t *testing.T) (*TestRedisServer, *redis.Client) {
 		}
 		close(ts.data)
 	})
-	c, err := redis.New(context.Background(), ts.Address())
+	c, err := New(context.Background(), ts.Address())
 	if err != nil {
 		t.Fatalf("Failed to connect redis.Client: %v", err)
 	}
@@ -103,12 +101,12 @@ func asSimpleString(s string) []byte {
 	return builder
 }
 
-func integrationClient(t *testing.T) *redis.Client {
+func integrationClient(t *testing.T) *Client {
 	t.Helper()
 	if os.Getenv("INTEGRATION") != "" {
 		t.Skip()
 	}
-	c, err := redis.New(context.Background(), ":6379")
+	c, err := New(context.Background(), ":6379")
 	if err != nil {
 		t.Fatalf("Failed to connect redis.Client: %v", err)
 	}
@@ -224,6 +222,61 @@ func TestClient_Set(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConcurrency(t *testing.T) {
+	t.Run("Should use two independent connections and put them back", func(t *testing.T) {
+		client, err := New(context.Background(), "-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn1, serv1 := net.Pipe()
+		conn2, serv2 := net.Pipe()
+		// Add two pipes to the client's connection pool
+		client.pool <- conn1
+		client.pool <- conn2
+		var wg sync.WaitGroup
+		wg.Add(2)
+		f := func() {
+			defer wg.Done()
+			_, _, err = client.Get(context.Background(), "Foo")
+			if err != nil {
+				t.Errorf("Got an error back from Get %v", err)
+			}
+		}
+		// Launch two concurrent Gets
+		go f()
+		go f()
+
+		// arbitrary size larger than all the messages
+		buf := make([]byte, 1024)
+
+		// Reads and writes are synchronous in a net.Pipe
+		// Because we are reading each request, but not writing a response, this proves
+		// there are two independent connections at play in the client
+		_, err = serv1.Read(buf)
+		if err != nil {
+			t.Error(err)
+		}
+		_, err = serv2.Read(buf)
+		if err != nil {
+			t.Error(err)
+		}
+		_, err = serv1.Write(asBulkString("Bar"))
+		if err != nil {
+			t.Error(err)
+		}
+		_, err = serv2.Write(asBulkString("Baz"))
+		if err != nil {
+			t.Error(err)
+		}
+
+		// all Gets are done
+		wg.Wait()
+		if len(client.pool) != 2 {
+			t.Errorf("Should have put both conns back, instead got %v", len(client.pool))
+		}
+	})
 }
 
 func Test_Integration(t *testing.T) {

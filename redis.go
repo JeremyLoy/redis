@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+const DefaultPoolSize = 10
+
 var crlf = []byte("\r\n")
 
 // Error is a type used to distinguish between i/o errors and errors from Redis itself.
@@ -26,49 +28,66 @@ func (e Error) Error() string {
 // A Client represents a single connection to Redis. It should be constructed with New. It is not safe for concurrent access.
 type Client struct {
 	dialer  net.Dialer
-	conn    net.Conn
+	pool    chan net.Conn
 	address string
 }
 
 // New creates a new Redis Client at the given address. It does not handle authentication at this time.
 func New(ctx context.Context, address string) (*Client, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 	return &Client{
 		address: address,
-		conn:    conn,
-		dialer:  dialer,
+		pool:    make(chan net.Conn, DefaultPoolSize),
 	}, nil
 }
 
-// Close closes the underlying net.Conn
+// Close closes all outstanding connections and prevents future operations on Client from succeeding
 func (c *Client) Close() error {
-	return c.conn.Close()
+	// for conn := range c.pool {
+	// 	conn.Close()
+	// }
+	// TODO figure out how to close channel safely
+	return nil
 }
 
-// Get the value of the given key. If you wish to distinguish between a nil or empty string, check the exists bool.
-// If you solely wish to check for existence, you should use Exists instead.
-func (c *Client) Get(ctx context.Context, key string) (value string, exists bool, err error) {
-	// Using named return values for documentation clarity, but I don't want to deal with it
-	// in the code because it's a messy feature. The real Get is implemented in get
-	return c.get(ctx, key)
-}
-
-func (c *Client) Set(ctx context.Context, key string, value string) error {
-	if deadline, set := ctx.Deadline(); set {
-		if err := c.conn.SetDeadline(deadline); err != nil {
-			return err
+func (c *Client) getConn(ctx context.Context) (net.Conn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case conn := <-c.pool:
+		deadline, _ := ctx.Deadline()
+		if err := conn.SetDeadline(deadline); err != nil {
+			conn.Close()
+			// Not sure why SetDeadline can fail, but if it does discard the Conn
+			// and try again below
+		} else {
+			return conn, nil
 		}
+	default:
 	}
+	return c.dialer.DialContext(ctx, "tcp", c.address)
+}
 
-	_, err := c.conn.Write(command(fmt.Sprintf("SET %s %s", key, value)))
+// Set key to hold the string value.
+// If key already holds a value, it is overwritten, regardless of its type.
+// Any previous time to live associated with the key is discarded on successful SET operation.
+func (c *Client) Set(ctx context.Context, key string, value string) error {
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return err
 	}
-	reader := bufio.NewReader(c.conn)
+	defer func() {
+		c.pool <- conn
+	}()
+	_, err = conn.Write(command(fmt.Sprintf("SET %s %s", key, value)))
+	if err != nil {
+		return err
+	}
+	reader := bufio.NewReader(conn)
 	msgType, err := reader.ReadByte()
 	if err != nil {
 		return err
@@ -91,19 +110,30 @@ func (c *Client) Set(ctx context.Context, key string, value string) error {
 	}
 }
 
-func (c *Client) get(ctx context.Context, key string) (string, bool, error) {
-	if deadline, set := ctx.Deadline(); set {
-		if err := c.conn.SetDeadline(deadline); err != nil {
-			return "", false, err
-		}
-	}
+// Get the value of the given key. If you wish to distinguish between a nil or empty string, check the exists bool.
+// If you solely wish to check for existence, you should use Exists instead.
+// An error is returned if the value stored at key is not a string, because GET only handles string values.
+func (c *Client) Get(ctx context.Context, key string) (value string, exists bool, err error) {
+	// Using named return values for documentation clarity, but I don't want to deal with it
+	// in the code because it's a messy feature. The real Get is implemented in get
+	return c.get(ctx, key)
+}
 
-	_, err := c.conn.Write(command("GET " + key))
+func (c *Client) get(ctx context.Context, key string) (string, bool, error) {
+	conn, err := c.getConn(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() {
+		c.pool <- conn
+	}()
+
+	_, err = conn.Write(command("GET " + key))
 	if err != nil {
 		return "", false, err
 	}
 
-	reader := bufio.NewReader(c.conn)
+	reader := bufio.NewReader(conn)
 	msgType, err := reader.ReadByte()
 	if err != nil {
 		return "", false, err
